@@ -1,0 +1,9 @@
+flask>=3.0.0
+werkzeug>=3.0.0
+python-magic>=0.4.27
+requests>=2.31.0
+watchdog>=4.0.0
+gunicorn>=21.2.0
+
+# torch, torchaudio, nemo_toolkit[asr] and CUDA are all provided
+# by the nvcr.io/nvidia/nemo:24.09 base image — do NOT add them here.

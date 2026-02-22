@@ -1,0 +1,151 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>bleeper</Name>
+  <Repository>ghcr.io/jakezp/bleep_test:latest</Repository>
+  <Registry>https://github.com/jakezp/bleep_test/pkgs/container/bleep_test</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/jakezp/bleep_test</Support>
+  <Project>https://github.com/jakezp/bleep_test</Project>
+  <Overview>Automated profanity filter pipeline for movies and TV shows. Downloads from Radarr/Sonarr trigger bleeping automatically: audio is muted and bleeped, subtitles redacted, and a clean "Family" audio track added alongside the original — all packaged back into the original MKV. Powered by whisperX (GPU-accelerated) and ffmpeg.</Overview>
+  <Category>MediaApp:Video Tools:</Category>
+  <WebUI>http://[IP]:[PORT:5000]/api/list_files</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/jakezp/bleep_test/main/unraid/bleeper.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/jakezp/bleep_test/main/unraid/bleeper-icon.png</Icon>
+  <ExtraParams>--gpus all</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>NVIDIA GPU recommended for amd64 (falls back to CPU). arm64 image uses CPU-only PyTorch automatically. Requires nvidia-driver Unraid plugin for GPU passthrough on amd64.</Requires>
+
+  <!-- ── Ports ─────────────────────────────────────────────────────────── -->
+  <Config
+    Name="API Port"
+    Target="5000"
+    Default="5000"
+    Mode="tcp"
+    Description="Bleeper Flask API port. Used by arr_hook.py and the web status endpoint."
+    Type="Port"
+    Display="always"
+    Required="true"
+    Mask="false">5000</Config>
+
+  <!-- ── Volumes ───────────────────────────────────────────────────────── -->
+  <Config
+    Name="Uploads / Staging"
+    Target="/app/uploads"
+    Default="/mnt/user/appdata/bleeper/uploads"
+    Mode="rw"
+    Description="Staging area where bleeper stores temp files during processing. Should be on a fast disk (cache recommended)."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/appdata/bleeper/uploads</Config>
+
+  <Config
+    Name="Media Library"
+    Target="/data/media"
+    Default="/mnt/user/media"
+    Mode="rw"
+    Description="Your media library root. Container path /data/media matches the standard arr stack convention so no path translation is needed."
+    Type="Path"
+    Display="always"
+    Required="true"
+    Mask="false">/mnt/user/media</Config>
+
+  <!-- ── Plex ──────────────────────────────────────────────────────────── -->
+  <Config
+    Name="Plex URL"
+    Target="PLEX_URL"
+    Default="http://plex:32400"
+    Mode=""
+    Description="URL of your Plex Media Server. Use the container name (e.g. http://plex:32400) if on the same Docker network, or the host IP."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false">http://plex:32400</Config>
+
+  <Config
+    Name="Plex Token"
+    Target="PLEX_TOKEN"
+    Default=""
+    Mode=""
+    Description="Your Plex authentication token. Find it at: Plex Web → account menu → 'Get Plex Token'. Leave empty to skip library refresh."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="true"></Config>
+
+  <Config
+    Name="Plex Section ID"
+    Target="PLEX_SECTION_ID"
+    Default="1"
+    Mode=""
+    Description="Plex library section ID(s) to refresh after bleeping. Single ID (e.g. 1), comma-separated for multiple (e.g. 1,2), or leave empty to refresh all sections. Find your section ID in Plex → your library → URL bar."
+    Type="Variable"
+    Display="always"
+    Required="false"
+    Mask="false">1</Config>
+
+  <!-- ── whisperX ──────────────────────────────────────────────────────── -->
+  <Config
+    Name="whisperX Model"
+    Target="WHISPERX_MODEL"
+    Default="large-v3"
+    Mode=""
+    Description="Whisper model size for transcription. Options: tiny, base, small, medium, large-v3. Larger = more accurate but slower. large-v3 recommended with GPU."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">large-v3</Config>
+
+  <Config
+    Name="whisperX Language"
+    Target="WHISPERX_LANGUAGE"
+    Default="en"
+    Mode=""
+    Description="Language code for transcription (e.g. en, fr, de). Leave as 'en' for English content."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">en</Config>
+
+  <Config
+    Name="whisperX Batch Size"
+    Target="WHISPERX_BATCH_SIZE"
+    Default="16"
+    Mode=""
+    Description="Transcription batch size. Increase for faster processing on high-VRAM GPUs (e.g. 32). Reduce if you get CUDA out-of-memory errors."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">16</Config>
+
+  <Config
+    Name="whisperX Compute Type"
+    Target="WHISPERX_COMPUTE_TYPE"
+    Default="float16"
+    Mode=""
+    Description="Compute type for whisperX. Use 'float16' for GPU (faster), 'int8' for CPU-only mode."
+    Type="Variable"
+    Display="advanced"
+    Required="false"
+    Mask="false">float16</Config>
+
+  <!-- ── Internal paths (fixed, no need to expose) ────────────────────── -->
+  <Config
+    Name="Upload Path (internal)"
+    Target="BLEEPER_UPLOAD"
+    Default="/app/uploads"
+    Mode=""
+    Description="Internal container path for the upload/staging volume. Do not change unless you remapped the uploads volume target."
+    Type="Variable"
+    Display="advanced"
+    Required="true"
+    Mask="false">/app/uploads</Config>
+
+</Container>

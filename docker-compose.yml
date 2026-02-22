@@ -1,0 +1,19 @@
+version: "3.9"
+services:
+  bleeper-parakeet:
+    build: .
+    image: bleeper-parakeet
+    container_name: bleeper-parakeet
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - BLEEPER_UPLOAD=/app/uploads
+      - WATCH_FOLDER=/media/incoming
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "5001:5000"        # use 5001 to avoid clash with bleep_test on 5000
+    volumes:
+      - /mnt/user/media:/media
+      - /mnt/user/appdata/bleeper-parakeet/uploads:/app/uploads
+    restart: unless-stopped
