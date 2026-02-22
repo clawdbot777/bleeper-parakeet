@@ -153,11 +153,40 @@ def main() -> None:
 
         # --- 3. Transcribe with timestamps ---
         print(f"[parakeet] Transcribing: {args.audio}", flush=True)
-        outputs       = model.transcribe([wav_path], timestamps=True)
-        result        = outputs[0]
-        word_stamps   = result.timestamp.get("word",    [])
-        segment_stamps = result.timestamp.get("segment", [])
 
+        word_stamps    = []
+        segment_stamps = []
+
+        try:
+            # NeMo 2.1+ API — timestamps=True keyword supported directly
+            outputs = model.transcribe([wav_path], timestamps=True)
+            result  = outputs[0]
+            word_stamps    = result.timestamp.get("word",    [])
+            segment_stamps = result.timestamp.get("segment", [])
+            print("[parakeet] Transcription complete (timestamps=True API).", flush=True)
+
+        except TypeError:
+            # NeMo 2.0.x (24.09 containers) — enable timestamps via decoding config
+            print("[parakeet] timestamps=True not supported — configuring decoding for timestamps.",
+                  file=sys.stderr, flush=True)
+            try:
+                from omegaconf import OmegaConf
+                decoding_cfg = model.cfg.decoding
+                with OmegaConf.open_dict(decoding_cfg):
+                    decoding_cfg.preserve_alignments = True
+                    decoding_cfg.compute_timestamps  = True
+                model.change_decoding_strategy(decoding_cfg)
+            except Exception as cfg_err:
+                print(f"[parakeet] WARNING: could not configure timestamps via decoding_cfg: {cfg_err}",
+                      file=sys.stderr, flush=True)
+
+            outputs = model.transcribe([wav_path], return_hypotheses=True)
+            result  = outputs[0]
+            ts = getattr(result, 'timestamp', None) or {}
+            word_stamps    = ts.get("word",    [])
+            segment_stamps = ts.get("segment", [])
+            print(f"[parakeet] Transcription complete (return_hypotheses API). "
+                  f"words={len(word_stamps)}, segments={len(segment_stamps)}", flush=True)
         # --- 4. Normalise to WhisperX JSON schema ---
         segments = []
         for seg in segment_stamps:
@@ -170,6 +199,56 @@ def main() -> None:
                 "text":  seg_text,
                 "words": _words_in_segment(word_stamps, seg_start, seg_end),
             })
+
+        # --- Fallback: no segment timestamps but have word timestamps ---
+        if not segments and word_stamps:
+            print("[parakeet] WARNING: no segment timestamps — building from word timestamps.",
+                  file=sys.stderr, flush=True)
+            # Group words into ~6s chunks
+            chunk, chunk_start = [], None
+            for w in word_stamps:
+                ws, we = float(w["start"]), float(w["end"])
+                if chunk_start is None:
+                    chunk_start = ws
+                chunk.append({"word": w["word"], "start": ws, "end": we})
+                if we - chunk_start >= 6.0:
+                    segments.append({
+                        "start": chunk_start,
+                        "end":   we,
+                        "text":  " ".join(x["word"] for x in chunk),
+                        "words": chunk,
+                    })
+                    chunk, chunk_start = [], None
+            if chunk:
+                segments.append({
+                    "start": chunk_start,
+                    "end":   chunk[-1]["end"],
+                    "text":  " ".join(x["word"] for x in chunk),
+                    "words": chunk,
+                })
+
+        # --- Fallback: no timestamps at all — single segment from full text ---
+        if not segments:
+            raw_text = getattr(result, 'text', '') or ''
+            if raw_text.strip():
+                print("[parakeet] WARNING: no timestamps at all — producing single segment with no word times.",
+                      file=sys.stderr, flush=True)
+                # Probe audio duration so we at least have a valid end time
+                try:
+                    dur_probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", wav_path],
+                        capture_output=True, text=True, check=True,
+                    )
+                    duration = float(dur_probe.stdout.strip())
+                except Exception:
+                    duration = 0.0
+                segments.append({
+                    "start": 0.0,
+                    "end":   duration,
+                    "text":  raw_text.strip(),
+                    "words": [],
+                })
 
         whisperx_json = {"segments": segments}
 
