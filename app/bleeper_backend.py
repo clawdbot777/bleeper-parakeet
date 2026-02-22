@@ -463,6 +463,39 @@ def _extract_center_channel(input_path: str, codec: str, bit_rate: int,
     return center_file, center_path
 
 
+def _extract_flr_channel(input_path: str, codec: str, bit_rate: int,
+                          sample_rate: int, base: str) -> tuple[str, str]:
+    """
+    Extract FL+FR as a stereo audio file for independent redaction.
+    Returns (flr_filename, flr_path).
+    """
+    if codec == "dts":
+        flr_file        = f"{base}_flr.wav"
+        flr_codec_args  = ["-c:a", "pcm_s32le"]
+    else:
+        flr_file        = f"{base}_flr.{codec}"
+        flr_codec_args  = []
+
+    flr_path = os.path.join(UPLOAD_FOLDER, flr_file)
+
+    cmd = (
+        ["ffmpeg", "-y"]
+        + _hwaccel_flags(video=False)
+        + ["-i", input_path,
+           "-filter_complex", "[0:a]pan=stereo|c0=FL|c1=FR[flr]",
+           "-map", "[flr]"]
+        + flr_codec_args
+    )
+    if bit_rate:
+        cmd += ["-b:a", str(bit_rate)]
+    if sample_rate:
+        cmd += ["-ar", str(sample_rate)]
+    cmd += ["-strict", "-2", flr_path]
+
+    _run(cmd, step="extract_flr_channel")
+    return flr_file, flr_path
+
+
 def _extract_loudnorm_json(output: str) -> dict | None:
     """
     Robustly extract the loudnorm JSON block from ffmpeg stderr.
@@ -606,18 +639,31 @@ def extract_audio_stream(job_id: str) -> dict:
         center_path  = audio_path
         loudness     = _measure_loudness(center_path)
 
+    # ---- Step E: Extract FL+FR stereo (for surround redaction) ------------
+    flr_file = None
+    if has_fc and "FL" in CHANNEL_LAYOUTS.get(layout, []) and "FR" in CHANNEL_LAYOUTS.get(layout, []):
+        try:
+            flr_file, _ = _extract_flr_channel(
+                audio_path, codec, bit_rate, sample_rate, base
+            )
+            logger.info(f"FL+FR stereo extracted → {flr_file}")
+        except Exception as exc:
+            logger.warning(f"FL+FR extraction failed (non-fatal): {exc}")
+            flr_file = None
+
     update_config(job_id, {
-        "audio_filename":    audio_file,
+        "audio_filename":      audio_file,
         "center_channel_file": center_file,
-        "loudness_info":     loudness,
-        "audio_stream_info": {
+        "flr_channel_file":    flr_file,
+        "loudness_info":       loudness,
+        "audio_stream_info":   {
             "streams": [stream2],
             "format":  info2.get("format", {}),
         },
-        "source_layout":     layout,
-        "source_channels":   channels,
-        "source_codec":      codec,
-        "source_bit_rate":   bit_rate,
+        "source_layout":      layout,
+        "source_channels":    channels,
+        "source_codec":       codec,
+        "source_bit_rate":    bit_rate,
         "source_sample_rate": sample_rate,
     })
     logger.info(f"Center channel extracted → {center_file}  (loudness: {loudness:.1f} LUFS)")
@@ -640,12 +686,35 @@ def transcribe_audio(job_id: str, whisperx_settings: dict | None = None) -> bool
 
     ws = whisperx_settings or {}
     _transcribe_parakeet(job_id, input_path, input_file, ws)
+
+    # ---- FL+FR pass -------------------------------------------------------
+    flr_file = config.get("flr_channel_file")
+    if flr_file:
+        flr_path = os.path.join(UPLOAD_FOLDER, flr_file)
+        if os.path.exists(flr_path):
+            logger.info("Transcribing FL+FR channel (VAD requested but not yet supported by Parakeet — transcribing full stream)…")
+            _transcribe_parakeet(
+                job_id, flr_path, flr_file, ws,
+                vad_filter=True,
+                config_keys=("flr_transcription_json", "flr_transcription_srt"),
+            )
+        else:
+            logger.warning(f"FL+FR file not found, skipping FL+FR transcription: {flr_path}")
+
     return True
 
 
 def _transcribe_parakeet(job_id: str, input_path: str, input_file: str,
-                          ws: dict) -> None:
-    """Transcribe using NVIDIA Parakeet TDT via parakeet_transcribe.py."""
+                          ws: dict,
+                          vad_filter: bool = False,
+                          config_keys: tuple[str, str] = ("transcription_json",
+                                                           "transcription_srt")) -> None:
+    """Transcribe using NVIDIA Parakeet TDT via parakeet_transcribe.py.
+
+    vad_filter — requests VAD pre-filtering; Parakeet doesn't natively support
+                 this yet so a warning is logged and the full stream is processed.
+    config_keys — (json_key, srt_key) under which output paths are stored.
+    """
     model  = ws.get("model", "nvidia/parakeet-tdt-0.6b-v3")
     script = os.path.join(os.path.dirname(__file__), "parakeet_transcribe.py")
 
@@ -655,17 +724,22 @@ def _transcribe_parakeet(job_id: str, input_path: str, input_file: str,
         "--output_dir", UPLOAD_FOLDER,
         "--model",      model,
     ]
-    _run(cmd, step="parakeet_transcribe")
+    if vad_filter:
+        cmd += ["--vad_filter"]   # accepted by script; logs a warning, no-op for now
 
-    base      = os.path.splitext(input_file)[0]
+    step = "flr_transcribe" if config_keys[0] != "transcription_json" else "parakeet_transcribe"
+    _run(cmd, step=step)
+
+    base      = os.path.splitext(os.path.basename(input_file))[0]
     json_file = f"{base}.json"
     srt_file  = f"{base}.srt"
+    json_key, srt_key = config_keys
     update_config(job_id, {
-        "transcription_json":    json_file,
-        "transcription_srt":     srt_file,
+        json_key:                json_file,
+        srt_key:                 srt_file,
         "transcription_backend": "parakeet",
     })
-    logger.info(f"Parakeet transcription complete → {json_file}, {srt_file}")
+    logger.info(f"Parakeet transcription complete [{json_key}] → {json_file}, {srt_file}")
 
 
 # ---------------------------------------------------------------------------
@@ -987,16 +1061,19 @@ def redact_audio(job_id: str,
     update_config(job_id, {"redacted_srt": out_srt_file})
 
     if not profanity_ts:
-        # No profanity detected — use center channel as-is (no bleeping needed)
-        logger.info("No profanity detected – skipping bleep filter.")
+        # No profanity in FC — use center channel as-is
+        logger.info("No profanity detected in FC – skipping FC bleep filter.")
         if channels <= 2:
             update_config(job_id, {"redacted_audio_stream_final": center_file})
+            logger.info("Redaction complete (no profanity found).")
+            return "Redaction completed successfully (no profanity)"
         else:
             update_config(job_id, {"redacted_channel_FC": center_file})
-        logger.info("Redaction complete (no profanity found).")
-        return "Redaction completed successfully (no profanity)"
+            _redact_flr_pass(job_id, config, profanity, duration, bit_rate, sample_rate, codec, pad_before, pad_after)
+            logger.info("Redaction complete.")
+            return "Redaction completed successfully"
 
-    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)
+    clean_intervals = get_non_profanity_intervals(profanity_ts, duration)  # noqa: F841
     filter_complex  = _build_ffmpeg_filter(profanity_ts, duration)
 
     # Apply bleep filter to center channel
@@ -1013,9 +1090,43 @@ def redact_audio(job_id: str,
             modified_center, bit_rate, sample_rate, codec, loudness
         )
         update_config(job_id, {"redacted_channel_FC": normalized_center})
+        _redact_flr_pass(job_id, config, profanity, duration, bit_rate, sample_rate, codec, pad_before, pad_after)
 
     logger.info("Redaction complete.")
     return "Redaction completed successfully"
+
+
+def _redact_flr_pass(job_id: str, config: dict, profanity: list[str],
+                     fc_duration: float, bit_rate, sample_rate, codec: str,
+                     pad_before: float, pad_after: float) -> None:
+    """Apply bleep filter to FL+FR stereo channel if FL+FR transcription exists."""
+    flr_json_filename = config.get("flr_transcription_json")
+    flr_file          = config.get("flr_channel_file")
+    if not (flr_json_filename and flr_file):
+        return
+
+    flr_json_path = os.path.join(UPLOAD_FOLDER, flr_json_filename)
+    flr_path      = os.path.join(UPLOAD_FOLDER, flr_file)
+    if not (os.path.exists(flr_json_path) and os.path.exists(flr_path)):
+        logger.warning("FL+FR transcription or audio file missing — skipping FL+FR redaction.")
+        return
+
+    with open(flr_json_path) as f:
+        flr_ts_data = json.load(f)
+
+    flr_profanity_ts = identify_profanity_timestamps(
+        flr_ts_data, profanity, pad_before=pad_before, pad_after=pad_after
+    )
+    if not flr_profanity_ts:
+        logger.info("FL+FR: no profanity detected — original FL+FR preserved.")
+        return
+
+    logger.info(f"FL+FR: {len(flr_profanity_ts)} profanity hit(s) — bleeping.")
+    flr_duration = flr_ts_data["segments"][-1]["end"] if flr_ts_data.get("segments") else fc_duration
+    flr_filter   = _build_ffmpeg_filter(flr_profanity_ts, flr_duration)
+    modified_flr = apply_complex_filter_to_audio(flr_path, flr_filter, bit_rate, sample_rate, codec)
+    update_config(job_id, {"redacted_channel_FLR": modified_flr})
+    logger.info(f"FL+FR redacted → {modified_flr}")
 
 
 # ---------------------------------------------------------------------------
@@ -1023,47 +1134,54 @@ def redact_audio(job_id: str,
 # Dynamically handles any channel layout – no more hardcoded 5.1(side).
 # ---------------------------------------------------------------------------
 
-def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: int) -> str:
+def _build_pan_filter(layout: str, fc_input_index: int, original_input_index: int,
+                      flr_input_index: int | None = None) -> str:
     """
-    Build the pan filter to replace the FC channel in the final mix.
+    Build the ffmpeg filter_complex to replace FC (and optionally FL+FR) in the final mix.
 
-    Strategy:
-      - All channels come from the original audio (input original_input_index).
-      - The FC channel (c2 for most 5.1/7.1 layouts) is replaced by the
-        redacted mono center (input fc_input_index, channel c0).
+    With flr_input_index=None  (FC only):
+        amerge=inputs=2  → original(n ch) + fc_mono(1 ch)
 
-    Returns an ffmpeg filter_complex string.
+    With flr_input_index set  (FC + FL+FR):
+        amerge=inputs=3  → original(n ch) + fc_mono(1 ch) + flr_stereo(2 ch)
+        pan replaces FC with c(n), FL with c(n+1), FR with c(n+2)
     """
-    channels = CHANNEL_LAYOUTS.get(layout)
-    if not channels:
-        # Fallback: just pass through the original audio unchanged
+    ch_list = CHANNEL_LAYOUTS.get(layout)
+    if not ch_list:
         logger.warning(f"Unknown layout {layout!r} – using passthrough.")
         return f"[{original_input_index}:a]acopy[final]"
 
-    n = len(channels)
+    n = len(ch_list)
 
-    if "FC" not in channels:
-        # No center channel – just pass through original audio
+    if "FC" not in ch_list:
         return f"[{original_input_index}:a]acopy[final]"
 
-    fc_idx = channels.index("FC")
-
-    # We use amerge + pan approach:
-    #   - input original_input_index: original audio (n channels)
-    #   - input fc_input_index: redacted center (1 channel = FC replacement)
-    # amerge gives us n+1 channels total; then pan selects correctly.
-    # Original channels occupy c0..c(n-1); redacted FC occupies c(n).
-    channel_map = "|".join(
-        f"c{i}=c{n + 0}" if ch == "FC" else f"c{i}=c{i}"
-        for i, ch in enumerate(channels)
-    )
-    filter_str = (
-        f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
-        f"[{original_input_index}:a][fc_mono]"
-        f"amerge=inputs=2[merged];"
-        f"[merged]pan={layout}|{channel_map}[final]"
-    )
-    return filter_str
+    if flr_input_index is not None and "FL" in ch_list and "FR" in ch_list:
+        # 3-input merge: original + fc_mono + flr_stereo
+        channel_map = "|".join(
+            f"c{i}=c{n}"     if ch == "FC" else
+            f"c{i}=c{n+1}"   if ch == "FL" else
+            f"c{i}=c{n+2}"   if ch == "FR" else
+            f"c{i}=c{i}"
+            for i, ch in enumerate(ch_list)
+        )
+        return (
+            f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
+            f"[{flr_input_index}:a]aformat=channel_layouts=stereo[flr_stereo];"
+            f"[{original_input_index}:a][fc_mono][flr_stereo]amerge=inputs=3[merged];"
+            f"[merged]pan={layout}|{channel_map}[final]"
+        )
+    else:
+        # 2-input merge: original + fc_mono only
+        channel_map = "|".join(
+            f"c{i}=c{n}" if ch == "FC" else f"c{i}=c{i}"
+            for i, ch in enumerate(ch_list)
+        )
+        return (
+            f"[{fc_input_index}:a]aformat=channel_layouts=mono[fc_mono];"
+            f"[{original_input_index}:a][fc_mono]amerge=inputs=2[merged];"
+            f"[merged]pan={layout}|{channel_map}[final]"
+        )
 
 
 def combine_media_file(job_id: str) -> str:
@@ -1085,6 +1203,10 @@ def combine_media_file(job_id: str) -> str:
     else:
         redacted_audio = config.get("redacted_channel_FC")
 
+    redacted_flr       = config.get("redacted_channel_FLR")
+    redacted_flr_path  = os.path.join(UPLOAD_FOLDER, redacted_flr) if redacted_flr else None
+    use_flr            = bool(redacted_flr_path and os.path.exists(redacted_flr_path))
+
     if not all([input_media_file, redacted_audio, redacted_srt]):
         raise ValueError("Missing input_filename, redacted_audio, or redacted_srt in config")
 
@@ -1104,29 +1226,26 @@ def combine_media_file(job_id: str) -> str:
         sub_streams   = [s for s in all_streams if s.get("codec_type") == "subtitle"]
         keep_sub_idxs = [i for i, s in enumerate(sub_streams)
                          if s.get("codec_name", "").lower() not in MOV_SUB_CODECS]
-        redacted_sub_idx = len(keep_sub_idxs)   # redacted SRT goes after kept subs
+        redacted_sub_idx = len(keep_sub_idxs)
     except Exception:
         sub_streams      = []
         keep_sub_idxs    = []
         redacted_sub_idx = 0
-
-    # Build sub map args — only kept subtitle streams
-    sub_map_args = [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
 
     if channels <= 2:
         cmd = (
             ["ffmpeg", "-y"]
             + _hwaccel_flags()
             + [
-                "-i", input_media_path,              # 0: original
-                "-i", redacted_audio_path,           # 1: redacted audio
-                "-i", redacted_srt_path,             # 2: redacted SRT
+                "-i", input_media_path,
+                "-i", redacted_audio_path,
+                "-i", redacted_srt_path,
                 "-map", "0:v",
-                "-map", "1:a",                       # family audio
-                "-map", f"0:a:{orig_stream_idx}",    # original audio
+                "-map", "1:a",
+                "-map", f"0:a:{orig_stream_idx}",
             ]
             + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-            + ["-map", "2:s",                        # redacted SRT
+            + ["-map", "2:s",
                "-c:v", "copy",
                "-c:a:0", codec,
                "-c:a:1", "copy",
@@ -1137,22 +1256,29 @@ def combine_media_file(job_id: str) -> str:
         audio_path  = os.path.join(UPLOAD_FOLDER, audio_file) if audio_file else None
 
         if audio_path and os.path.exists(audio_path):
+            # Inputs: 0=MKV, 1=extracted audio, 2=redacted FC, [3=redacted FLR], N=SRT
+            extra_inputs  = ["-i", redacted_flr_path] if use_flr else []
+            srt_input_idx = 3 + int(use_flr)
+            flr_idx       = 3 if use_flr else None
             cmd = (
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
                 + [
-                    "-i", input_media_path,              # 0: original MKV
-                    "-i", audio_path,                    # 1: extracted audio
-                    "-i", redacted_audio_path,           # 2: redacted FC
-                    "-i", redacted_srt_path,             # 3: redacted SRT
-                    "-filter_complex",
-                    _build_pan_filter(layout, fc_input_index=2, original_input_index=1),
-                    "-map", "0:v",
-                    "-map", "[final]",                   # family audio
-                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                    "-i", input_media_path,
+                    "-i", audio_path,
+                    "-i", redacted_audio_path,
+                ]
+                + extra_inputs
+                + ["-i", redacted_srt_path,
+                   "-filter_complex",
+                   _build_pan_filter(layout, fc_input_index=2, original_input_index=1,
+                                     flr_input_index=flr_idx),
+                   "-map", "0:v",
+                   "-map", "[final]",
+                   "-map", f"0:a:{orig_stream_idx}",
                 ]
                 + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-                + ["-map", "3:s",                        # redacted SRT
+                + [f"-map", f"{srt_input_idx}:s",
                    "-c:v", "copy",
                    "-c:a:0", codec,
                 ]
@@ -1162,17 +1288,20 @@ def combine_media_file(job_id: str) -> str:
                 ["ffmpeg", "-y"]
                 + _hwaccel_flags()
                 + [
-                    "-i", input_media_path,              # 0: original MKV
-                    "-i", redacted_audio_path,           # 1: redacted FC
-                    "-i", redacted_srt_path,             # 2: redacted SRT
-                    "-filter_complex",
-                    _build_pan_filter(layout, fc_input_index=1, original_input_index=0),
-                    "-map", "0:v",
-                    "-map", "[final]",                   # family audio
-                    "-map", f"0:a:{orig_stream_idx}",    # original audio
+                    "-i", input_media_path,
+                    "-i", redacted_audio_path,
+                ]
+                + (["-i", redacted_flr_path] if use_flr else [])
+                + ["-i", redacted_srt_path,
+                   "-filter_complex",
+                   _build_pan_filter(layout, fc_input_index=1, original_input_index=0,
+                                     flr_input_index=2 if use_flr else None),
+                   "-map", "0:v",
+                   "-map", "[final]",
+                   "-map", f"0:a:{orig_stream_idx}",
                 ]
                 + [arg for idx in keep_sub_idxs for arg in ["-map", f"0:s:{idx}"]]
-                + ["-map", "2:s",                        # redacted SRT
+                + ["-map", f"{2 + int(use_flr)}:s",
                    "-c:v", "copy",
                    "-c:a:0", codec,
                 ]
@@ -1266,16 +1395,19 @@ def cleanup_job_files(job_id: str) -> str:
 
     base = os.path.splitext(input_filename)[0]
     patterns = [
-        f"{job_id}_*",           # config + any job-tagged files
-        f"{base}_center*.*",
+        f"{job_id}_*",            # config + any job-tagged files
+        f"{base}*center*.*",      # center channel extractions (e.g. _norm_center.ac3)
+        f"{base}*flr*.*",         # FL+FR stereo extractions
         f"{base}_audio*.*",
         f"{base}_norm*.*",
         f"{base}_*redacted*.*",
         f"{base}_*normalized*.*",
         f"{base}_*final*.*",
-        f"{base}*.json",         # whisperX transcript
-        f"{base}*.srt",          # raw + redacted SRT
-        f"{base}*.ac3",          # normalized + extracted audio
+        f"{base}*.json",          # transcription JSON
+        f"{base}*.srt",           # raw + redacted SRT
+        f"{base}*.vtt",           # WebVTT subtitles
+        f"{base}*.txt",           # plain-text transcript
+        f"{base}*.ac3",           # normalized + extracted audio
         f"{base}*.dts",
         f"{base}*.aac",
         f"{base}*.flac",

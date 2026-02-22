@@ -120,7 +120,13 @@ def main() -> None:
     parser.add_argument("--output_dir", default=".", help="Directory for output files.")
     parser.add_argument("--model",      default="nvidia/parakeet-tdt-0.6b-v3",
                         help="HuggingFace model name (default: parakeet-tdt-0.6b-v3).")
+    parser.add_argument("--vad_filter", action="store_true",
+                        help="Request VAD pre-filtering (not yet supported — logged as warning).")
     args = parser.parse_args()
+
+    if args.vad_filter:
+        print("[parakeet] WARNING: --vad_filter requested but not yet supported by Parakeet backend. "
+              "Transcribing full stream.", file=sys.stderr, flush=True)
 
     if not os.path.exists(args.audio):
         print(f"ERROR: Audio file not found: {args.audio}", file=sys.stderr)
